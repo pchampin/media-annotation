@@ -1,0 +1,301 @@
+#!/usr/bin/env python
+# Copyright (c) 2011, Pierre-Antoine Champin <http://champin.net/>, 
+#                     University of Lyon
+# All rights reserved.
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of the University of Lyon nor the names of its
+#       contributors may be used to endorse or promote products derived from
+#       from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS ``AS IS''
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR AND CONTRIBUTORS BE LIABLE FOR
+# ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+"""
+I take a list of MP3 files as argument, and outputs the corresponding RDF
+according to the mapping defined by the Ontology for Media Resource [1]_.
+
+RDF can be generated according to the following *profiles*:
+  * ``default`` will generate ``ma:`` properties for exact matches, and
+    ``id3v2:`` properties with subProperty axioms for related match.
+  * ``ma-only`` will only generate ``ma:`` properties.
+  * ``original`` will always generate ``id3v2:`` properties (even for exact
+    matches) with subProperty axioms to the corresponding ``ma:`` property.
+
+Furthermore, *extended* metadata (i.e. not specified by [1]_) can be generated:
+  * builds a smart title from TIT1, TIT2 and TIT3 (if appropriate)
+  * generate a URI for the language (if any)
+  * use ma:title instead of rdfs:label for TALB (album title)
+
+[1] http://www.w3.org/TR/mediaont-10/
+"""
+
+from mutagen.id3 import ID3, ID3NoHeaderError
+from optparse import OptionParser
+from os import curdir
+from os.path import abspath
+from rdflib import BNode, Literal, Namespace, RDF, RDFS, URIRef
+from rdflib.Graph import Graph
+from sys import stderr
+from urllib import pathname2url
+
+def main():
+    global OPTIONS
+    OPTIONS, args = parse_options()
+    graph = Graph()
+    for filename in args:
+        fill_graph(graph, filename)
+        graph.bind("", "file://%s/" % pathname2url(abspath(curdir)))
+        graph.bind("foaf", FOAF)
+        graph.bind("id3v2", ID3V2)
+        graph.bind("lexvo", LEXVO)
+        graph.bind("ma", MA)
+        graph.bind("xsd", XSD)
+    try:
+        print graph.serialize(format="turtle")
+    except Exception:
+        # for debug reason
+        from pprint import pprint
+        pprint(list(graph))
+        raise
+
+def fill_graph(graph, filename):
+    try:
+        id3 = ID3(filename)
+    except ID3NoHeaderError:
+        # FIXME: should we insert some triples anyway (e.g. RDF.type) ?
+        return
+
+    res = URIRef("file://"+pathname2url(abspath(filename)))
+    t = lambda s, p, o: graph.add((s, p, o))
+
+    t(res, RDF.type, MA.AudioTrack)
+
+    def add_metadata(key, ma_prop, exact=True,
+                     val_factory=make_string_literal,
+                     insert_node=False,
+                     node_factory=None,
+                     second_property=RDFS.label,
+                     ):
+        ma_prop = MA[ma_prop]
+        frame = id3.get(key)
+        if frame is not None:
+
+            if exact and OPTIONS.profile == "original" \
+            or not exact and OPTIONS.profile != "ma-only":
+                prop = ID3V2[key]
+                t(prop, RDFS.subPropertyOf, ma_prop)
+            else:
+                prop = ma_prop
+
+            if insert_node and node_factory is None:
+                node_factory = lambda _: BNode()
+
+            for val in frame.text:
+                try:
+                    obj = val_factory(val)
+                except SkipValue:
+                    continue
+                if insert_node:
+                    subj = node_factory(val)
+                    t(res, prop, subj)
+                    prop2 = second_property
+                else:
+                    subj = res
+                    prop2 = prop
+                t(subj, prop2, val_factory(val))
+    
+    add_metadata("TIT2", "title", False)
+    if OPTIONS.extended:
+        make_smart_title(id3, res, t)
+        
+    add_metadata("TIT3", "title", False)
+    # FIXME: as an extension, should add a related resource if TOAL, TOPE or
+    # TOLY are provided
+
+    # FIXME: should convert ISO_639-2 labek to BCPl 47
+    if OPTIONS.extended:
+        # FIXME: ID3V2 is ISO_639-2, but lexvo uses ISO_639-3 ; they should be
+        # the same in most cases, but maybe not always (or use BCP 47?? as well)
+        lang_factory = lambda code: \
+            URIRef("http://lexvo.org/id/iso639-3/" + code)
+    else:
+        lang_factory = None # will generate bnode
+    add_metadata("TLAN", "hasLanguage", insert_node=True,
+                 node_factory=lang_factory)
+
+    add_metadata("TPE2", "hasContributor", False, insert_node=True)
+    add_metadata("TPE3", "hasContributor", False, insert_node=True)
+    add_metadata("TPE4", "hasContributor", False, insert_node=True)
+    add_metadata("TEXT", "hasContributor", False, insert_node=True)
+    add_metadata("TMCL", "hasContributor", False, insert_node=True)
+    add_metadata("TIPL", "hasContributor", False, insert_node=True)
+    add_metadata("TENC", "hasContributor", False, insert_node=True)
+    add_metadata("TCOM", "hasContributor", False, insert_node=True)
+
+    add_metadata("TPE1", "hasCreator", False, insert_node=True)
+
+    add_metadata("TDRC", "recordDate", val_factory=make_date_literal)
+    add_metadata("TDEN", "date", False, val_factory=make_date_literal)
+    add_metadata("TDRL", "releaseDate", val_factory=make_date_literal)
+    add_metadata("TDTG", "date", False, val_factory=make_date_literal)
+    # FIXME: also date in OWNE?
+
+    # FIXME: mapping table says TCOP should be used for location... how??
+
+    add_metadata("TMOO", "hasKeyword", False, insert_node=True)
+
+    # NB: mutagen automatically converts ID3v1 genre-codes to strings
+    add_metadata("TCON", "hasGenre", True, insert_node=True)
+
+    for key, popm in id3.items():
+        if key.startswith("POPM"):
+            rating = BNode()
+            t(res, MA.hasRating, rating)
+            t(rating, MA.hasRatingSystem, ID3V2.POPM)
+            t(rating, MA.ratingScaleMin, make_double_literal(0.0))
+            t(rating, MA.ratingScaleMax, make_double_literal(255.0))
+            rater = BNode()
+            t(rating, MA.isProvidedBy, rater)
+            t(rater, RDFS.label, make_string_literal(popm.email))
+            if OPTIONS.extended:
+                t(rater, FOAF.mbox, URIRef("mailto:" + popm.email))
+            t(rating, MA.ratingValue, make_double_literal(1.0*popm.rating))
+        
+    if OPTIONS.extended:
+        prop = MA["title"]
+        t(MA["title"], RDFS.subPropertyOf, RDFS.label)
+    else:
+        prop = RDFS.label
+    add_metadata("TALB", "isMemberOf", insert_node=True, second_property=prop)
+
+    add_metadata("TPUB", "hasPublisher", insert_node=True)
+
+    # TODO: convert TFLT value?
+    add_metadata("TFLT", "hasCompression", True, insert_node=True)
+
+    add_metadata("TLEN", "duration", val_factory=make_duration_literal)
+
+
+def make_string_literal(txt):
+    return Literal(txt, lang=OPTIONS.language)
+
+def make_double_literal(val):
+    return Literal(float(val), datatype=XSD.double)
+
+def make_duration_literal(txt):
+    return make_double_literal(int(txt)/1000.0)
+
+def make_date_literal(txt):
+    txt = str(txt)
+    if len(txt) < 10:
+        raise SkipValue()
+    else:
+        return Literal(txt[:10], datatype=XSD.date)
+
+def make_smart_title(id3, res, t):
+    """
+    This function tries to combine TIT1, TIT2 and TIT3 to build a nice complete
+    title, of the form "TIT1 - TIT2 (TIT3)".
+
+    It assumes that TIT1, TIT2 and TIT3 contain at most one value each (with an
+    exception for TIT2, see below). If it is not the case, this function will
+    fail to generate the smart title.
+
+    Note that all the tools I have tested (id3v2, vlc, nautilus) do not
+    implement such a mechanism (they simply display TIT2), although it makes
+    sense according to the definitions of TIT1 and TIT3. So I would expect that
+    most files contain a value in TIT2 with the full title in order to be
+    correctly displayed by such tools. This function tries to detect this value
+    and does not use it for the generation.
+
+    :params:
+      * id3: the ID3 metadata coniptainer
+      * res: the URIref of the resource described by id3
+      * t: the function to add a triple
+    """
+    tit1s = getattr(id3.get("TIT1"), "text", [])
+    tit2s = getattr(id3.get("TIT2"), "text", [])
+    tit3s = getattr(id3.get("TIT3"), "text", [])
+
+    if len(tit1s) > 1 or len(tit2s) == 0 or len(tit3s) > 1:
+        return # too many values
+
+    tit1 = tit1s and tit1s[0] or ""
+    tit3 = tit3s and tit3s[0] or ""
+
+    if not tit1 and not tit3:
+        return # no smart title, only plain TIT2
+
+    def is_full_title(txt):
+        if tit1 and not txt.startswith(tit1):
+            return False
+        if tit3 and not txt.endswith("(%s)" % tit3):
+            return False
+        return True
+    tit2s = [ txt for txt in tit2s if not is_full_title(txt) ]
+
+    if len(tit2s) > 1:
+        return # too many values
+
+    tit2 = tit2s[0]
+    if tit1:
+        tit1 = "%s - " % tit1
+    if tit3:
+        tit3 = " (%s)" % tit3
+    "%s%s%s" % (tit1, tit2, tit3)
+    lit = make_string_literal("%s%s%s" % (tit1, tit2, tit3))
+    t(res, MA["title"], lit)
+
+class SkipValue(Exception):
+    """
+    Use by value factory to indicate that the candidate value is not valid.
+    """
+    pass
+
+def parse_options():
+    op = OptionParser()
+    op.add_option("-H", "--long-help", action="store_true", default=False,
+                  help="display long help")
+    op.add_option("-p", "--profile", default="default",
+                  choices=["ma-only", "default", "original"])
+    op.add_option("-x", "--extended", action="store_true", default=False)
+    op.add_option("-l", "--language", default=None,
+                  help="language tag for metadata")
+
+    options, args = op.parse_args()
+
+    if options.long_help:
+        op.print_help()
+        print __doc__
+        exit(0)
+
+    return options, args
+
+OPTIONS = None
+
+FOAF = Namespace("http://xmlns.com/foaf/0.1/")
+ID3V2 = Namespace("http://www.id3.org/id3v2.3.0#")
+LEXVO = Namespace("http://lexvo.org/id/iso639-3/")
+MA = Namespace("http://www.w3.org/ns/ma-ont#")
+#SKOS = Namespace("http://www.w3.org/2004/02/skos/core#")
+XSD = Namespace("http://www.w3.org/2001/XMLSchema#")
+
+
+if __name__ == "__main__":
+    main()
