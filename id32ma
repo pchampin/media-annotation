@@ -25,6 +25,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#pylint: disable=I0011,C0103,C0111,R0912,R0913,R0915,W0142,W0511,W0603
 
 """
 I take a list of MP3 files as argument, and outputs the corresponding RDF
@@ -41,6 +42,7 @@ Furthermore, *extended* metadata (i.e. not specified by [1]_) can be generated:
   * builds a smart title from TIT1, TIT2 and TIT3 (if appropriate)
   * generate a URI for the language (if any)
   * use ma:title instead of rdfs:label for TALB (album title)
+  * use foaf:name instead of rdfs:label for instances of ma:Person
 
 [1] http://www.w3.org/TR/mediaont-10/
 """
@@ -49,10 +51,11 @@ from mutagen.id3 import ID3, ID3NoHeaderError
 from optparse import OptionParser
 from os import curdir
 from os.path import abspath
+from pprint import pprint
 from rdflib import BNode, Literal, Namespace, RDF, RDFS, URIRef
 from rdflib.Graph import Graph
-from sys import stderr
-from urllib import pathname2url
+from rdflib.Node import Node
+from urllib import pathname2url, quote
 
 def main():
     global OPTIONS
@@ -65,12 +68,12 @@ def main():
         graph.bind("id3v2", ID3V2)
         graph.bind("lexvo", LEXVO)
         graph.bind("ma", MA)
+        graph.bind("owl", OWL)
         graph.bind("xsd", XSD)
     try:
         print graph.serialize(format="turtle")
     except Exception:
         # for debug reason
-        from pprint import pprint
         pprint(list(graph))
         raise
 
@@ -82,44 +85,77 @@ def fill_graph(graph, filename):
         return
 
     res = URIRef("file://"+pathname2url(abspath(filename)))
-    t = lambda s, p, o: graph.add((s, p, o))
 
-    t(res, RDF.type, MA.AudioTrack)
+    # first defining some helper functions
 
-    def add_metadata(key, ma_prop, exact=True,
-                     val_factory=make_string_literal,
-                     insert_node=False,
-                     node_factory=None,
-                     second_property=RDFS.label,
-                     ):
+    def t(s, p, o):
+        assert isinstance(s, Node), s
+        assert isinstance(p, Node), p
+        assert isinstance(o, Node), o
+        graph.add((s, p, o))
+
+    def add_metadata(
+        key, # the ID3 frame to use
+        ma_prop, # the name of the ma property to use
+        exact=True, # is the ID3 prop an exact match to ma_prop?
+        val_factory=make_string_literal, # to transform ID3 value to MA value
+        insert_node=False, # whether an intermediate node must be inserted
+        # the following parameters are only used if OPTIONS.extended is True
+        node_factory=None, # function to make the intermediate node
+        label_property=None, # property to label the intermediate node
+    ):
+        """Smart metadata inserter"""
+
         ma_prop = MA[ma_prop]
         frame = id3.get(key)
         if frame is not None:
 
-            if exact and OPTIONS.profile == "original" \
-            or not exact and OPTIONS.profile != "ma-only":
-                prop = ID3V2[key]
-                t(prop, RDFS.subPropertyOf, ma_prop)
+            if hasattr(frame, "people"):
+                paired_list = frame.people
             else:
-                prop = ma_prop
+                paired_list = [ (key, val) for val in frame.text ]
 
-            if insert_node and node_factory is None:
-                node_factory = lambda _: BNode()
+            for key, val in paired_list:
 
-            for val in frame.text:
+                if exact and OPTIONS.profile == "original" \
+                or not exact and OPTIONS.profile != "ma-only":
+                    prop = ID3V2[key]
+                    t(prop, RDFS.subPropertyOf, ma_prop)
+                else:
+                    prop = ma_prop
+
+
                 try:
                     obj = val_factory(val)
                 except SkipValue:
                     continue
                 if insert_node:
+                    if node_factory is None or not OPTIONS.extended:
+                        node_factory = lambda _: BNode()
+                    if label_property is None or not OPTIONS.extended:
+                        label_property = RDFS.label
+                    else:
+                        t(label_property, RDFS.subPropertyOf, RDFS.label)
                     subj = node_factory(val)
                     t(res, prop, subj)
-                    prop2 = second_property
+                    prop2 = label_property
                 else:
                     subj = res
                     prop2 = prop
-                t(subj, prop2, val_factory(val))
+                t(subj, prop2, obj)
+
+    # now populating the graph
+
+    if OPTIONS.owl_import:
+        ont_node = BNode()
+        t(ont_node, RDF.type, OWL.Ontology)
+        t(ont_node, OWL.imports, URIRef("http://www.w3.org/ns/ma-ont"))
+
+    t(res, RDF.type, MA.MediaResource)
+    t(res, RDF.type, MA.AudioTrack)
     
+    add_metadata("TIT1", "description", False)
+
     add_metadata("TIT2", "title", False)
     if OPTIONS.extended:
         make_smart_title(id3, res, t)
@@ -128,35 +164,28 @@ def fill_graph(graph, filename):
     # FIXME: as an extension, should add a related resource if TOAL, TOPE or
     # TOLY are provided
 
-    # FIXME: should convert ISO_639-2 labek to BCPl 47
-    if OPTIONS.extended:
-        # FIXME: ID3V2 is ISO_639-2, but lexvo uses ISO_639-3 ; they should be
-        # the same in most cases, but maybe not always (or use BCP 47?? as well)
-        lang_factory = lambda code: \
-            URIRef("http://lexvo.org/id/iso639-3/" + code)
-    else:
-        lang_factory = None # will generate bnode
     add_metadata("TLAN", "hasLanguage", insert_node=True,
-                 node_factory=lang_factory)
+                 val_factory=lang_val_factory, node_factory=lang_node_factory)
 
-    add_metadata("TPE2", "hasContributor", False, insert_node=True)
-    add_metadata("TPE3", "hasContributor", False, insert_node=True)
-    add_metadata("TPE4", "hasContributor", False, insert_node=True)
-    add_metadata("TEXT", "hasContributor", False, insert_node=True)
-    add_metadata("TMCL", "hasContributor", False, insert_node=True)
-    add_metadata("TIPL", "hasContributor", False, insert_node=True)
-    add_metadata("TENC", "hasContributor", False, insert_node=True)
-    add_metadata("TCOM", "hasContributor", False, insert_node=True)
-
-    add_metadata("TPE1", "hasCreator", False, insert_node=True)
+    contributor_kw = { "exact": False, "insert_node": True,
+                       "label_property": FOAF.name }
+    add_metadata("TPE2", "hasContributor", **contributor_kw)
+    add_metadata("TPE3", "hasContributor", **contributor_kw)
+    add_metadata("TPE4", "hasContributor", **contributor_kw)
+    add_metadata("TEXT", "hasContributor", **contributor_kw)
+    add_metadata("TMCL", "hasContributor", **contributor_kw)
+    add_metadata("TIPL", "hasContributor", **contributor_kw)
+    add_metadata("TENC", "hasContributor", **contributor_kw)
+    # NB: TCOM is not present in the mappin table, but that makes sense
+    add_metadata("TCOM", "hasContributor", **contributor_kw)
+    
+    add_metadata("TPE1", "hasCreator", **contributor_kw)
 
     add_metadata("TDRC", "recordDate", val_factory=make_date_literal)
     add_metadata("TDEN", "date", False, val_factory=make_date_literal)
     add_metadata("TDRL", "releaseDate", val_factory=make_date_literal)
     add_metadata("TDTG", "date", False, val_factory=make_date_literal)
     # FIXME: also date in OWNE?
-
-    # FIXME: mapping table says TCOP should be used for location... how??
 
     add_metadata("TMOO", "hasKeyword", False, insert_node=True)
 
@@ -168,38 +197,51 @@ def fill_graph(graph, filename):
             rating = BNode()
             t(res, MA.hasRating, rating)
             t(rating, MA.hasRatingSystem, ID3V2.POPM)
-            t(rating, MA.ratingScaleMin, make_double_literal(0.0))
-            t(rating, MA.ratingScaleMax, make_double_literal(255.0))
+            t(rating, MA.ratingScaleMin, make_decimal_literal(0.0))
+            t(rating, MA.ratingScaleMax, make_decimal_literal(255.0))
             rater = BNode()
             t(rating, MA.isProvidedBy, rater)
             t(rater, RDFS.label, make_string_literal(popm.email))
             if OPTIONS.extended:
                 t(rater, FOAF.mbox, URIRef("mailto:" + popm.email))
-            t(rating, MA.ratingValue, make_double_literal(1.0*popm.rating))
+            t(rating, MA.ratingValue, make_decimal_literal(1.0*popm.rating))
         
-    if OPTIONS.extended:
-        prop = MA["title"]
-        t(MA["title"], RDFS.subPropertyOf, RDFS.label)
-    else:
-        prop = RDFS.label
-    add_metadata("TALB", "isMemberOf", insert_node=True, second_property=prop)
+    add_metadata("TALB", "isMemberOf", insert_node=True,
+                 label_property=MA["title"])
 
-    add_metadata("TPUB", "hasPublisher", insert_node=True)
+    add_metadata("TPUB", "hasPublisher", insert_node=True,
+                 label_property=FOAF.name)
 
     # TODO: convert TFLT value?
-    add_metadata("TFLT", "hasCompression", True, insert_node=True)
+    add_metadata("TFLT", "hasCompression", False, insert_node=True)
+    add_metadata("TFLT", "hasFormat", True, insert_node=True)
 
     add_metadata("TLEN", "duration", val_factory=make_duration_literal)
+
+    add_metadata("TCOP", "copyright", True)
+
+    for key, apic in id3.items():
+        if key.startswith("APIC"):
+            if apic.mime == "-->":
+                related = URIRef(apic.data)
+            else:
+                related = URIRef(res+"#id3-APIC-"+quote(apic.desc))
+            if OPTIONS.profile == "ma-only":
+                prop = MA.hasRelatedImage
+            else:
+                prop = ID3V2["APIC-%s" % apic.type]
+                t(prop, RDFS.subPropertyOf, MA.relation)
+            t(res, prop, related)
 
 
 def make_string_literal(txt):
     return Literal(txt, lang=OPTIONS.language)
 
-def make_double_literal(val):
-    return Literal(float(val), datatype=XSD.double)
+def make_decimal_literal(val):
+    return Literal(float(val), datatype=XSD.decimal)
 
 def make_duration_literal(txt):
-    return make_double_literal(int(txt)/1000.0)
+    return make_decimal_literal(int(txt)/1000.0)
 
 def make_date_literal(txt):
     txt = str(txt)
@@ -258,9 +300,18 @@ def make_smart_title(id3, res, t):
         tit1 = "%s - " % tit1
     if tit3:
         tit3 = " (%s)" % tit3
-    "%s%s%s" % (tit1, tit2, tit3)
     lit = make_string_literal("%s%s%s" % (tit1, tit2, tit3))
     t(res, MA["title"], lit)
+
+def lang_val_factory(code):
+    # FIXME: should convert ISO_639-2 label to BCPl 47
+    return make_string_literal(code)
+
+def lang_node_factory(code):
+    # FIXME: ID3V2 is ISO_639-2, but lexvo uses ISO_639-3 ; they should be
+    # the same in most cases, but maybe not always (or use BCP 47?? as well)
+    return URIRef("http://lexvo.org/id/iso639-3/" + code)
+
 
 class SkipValue(Exception):
     """
@@ -272,6 +323,8 @@ def parse_options():
     op = OptionParser()
     op.add_option("-H", "--long-help", action="store_true", default=False,
                   help="display long help")
+    op.add_option("-o", "--owl-import", action="store_true", default=False,
+                  help="include OWL import statement")
     op.add_option("-p", "--profile", default="default",
                   choices=["ma-only", "default", "original"])
     op.add_option("-x", "--extended", action="store_true", default=False)
@@ -293,6 +346,7 @@ FOAF = Namespace("http://xmlns.com/foaf/0.1/")
 ID3V2 = Namespace("http://www.id3.org/id3v2.3.0#")
 LEXVO = Namespace("http://lexvo.org/id/iso639-3/")
 MA = Namespace("http://www.w3.org/ns/ma-ont#")
+OWL = Namespace("http://www.w3.org/2002/07/owl#")
 #SKOS = Namespace("http://www.w3.org/2004/02/skos/core#")
 XSD = Namespace("http://www.w3.org/2001/XMLSchema#")
 
