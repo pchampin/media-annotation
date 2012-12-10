@@ -39,45 +39,25 @@ RDF can be generated according to the following *profiles*:
     matches) with subProperty axioms to the corresponding ``ma:`` property.
 
 Furthermore, *extended* metadata (i.e. not specified by [1]_) can be generated:
-  * builds a smart title from TIT1, TIT2 and TIT3 (if appropriate)
   * generate a URI for the language (if any)
-  * use ma:title instead of rdfs:label for TALB (album title)
   * use foaf:name instead of rdfs:label for instances of ma:Person
+  * builds a smart title from TIT1, TIT2 and TIT3 (if appropriate)
+  * use ma:title instead of rdfs:label for TALB (album title)
 
 [1] http://www.w3.org/TR/mediaont-10/
 """
 
 from mutagen.id3 import ID3, ID3NoHeaderError
-from optparse import OptionParser
-from os import curdir
 from os.path import abspath
-from pprint import pprint
-from rdflib import BNode, Literal, Namespace, RDF, RDFS, URIRef
-from rdflib.Graph import Graph
+from rdflib import BNode, Namespace, RDF, RDFS, URIRef
 from rdflib.Node import Node
 from urllib import pathname2url, quote
 
-def main():
-    global OPTIONS
-    OPTIONS, args = parse_options()
-    graph = Graph()
-    graph.bind("", "file://%s/" % pathname2url(abspath(curdir)))
-    graph.bind("foaf", FOAF)
-    graph.bind("id3v2", ID3V2)
-    graph.bind("lexvo", LEXVO)
-    graph.bind("ma", MA)
-    graph.bind("owl", OWL)
-    graph.bind("xsd", XSD)
-    for filename in args:
-        fill_graph(graph, filename)
-    try:
-        print graph.serialize(format="turtle")
-    except Exception:
-        # for debug reason
-        pprint(list(graph))
-        raise
+from ma_common import FOAF, MA, lang_node_factory, main, make_date_literal, \
+    make_decimal_literal, make_string_literal, SkipValue
 
-def fill_graph(graph, filename):
+def fill_graph(graph, filename, profile, extended):
+    #pylint: disable=I0011,R0914
     try:
         id3 = ID3(filename)
     except ID3NoHeaderError:
@@ -100,7 +80,7 @@ def fill_graph(graph, filename):
         exact=True, # is the ID3 prop an exact match to ma_prop?
         val_factory=make_string_literal, # to transform ID3 value to MA value
         insert_node=False, # whether an intermediate node must be inserted
-        # the following parameters are only used if OPTIONS.extended is True
+        # the following parameters are only used if extended is True
         node_factory=None, # function to make the intermediate node
         label_property=None, # property to label the intermediate node
     ):
@@ -117,8 +97,8 @@ def fill_graph(graph, filename):
 
             for key, val in paired_list:
 
-                if exact and OPTIONS.profile == "original" \
-                or not exact and OPTIONS.profile != "ma-only":
+                if exact and profile == "original" \
+                or not exact and profile != "ma-only":
                     prop = ID3V2[key]
                     t(prop, RDFS.subPropertyOf, ma_prop)
                 else:
@@ -130,9 +110,9 @@ def fill_graph(graph, filename):
                 except SkipValue:
                     continue
                 if insert_node:
-                    if node_factory is None or not OPTIONS.extended:
+                    if node_factory is None or not extended:
                         node_factory = lambda _: BNode()
-                    if label_property is None or not OPTIONS.extended:
+                    if label_property is None or not extended:
                         label_property = RDFS.label
                     else:
                         t(label_property, RDFS.subPropertyOf, RDFS.label)
@@ -146,10 +126,8 @@ def fill_graph(graph, filename):
 
     # now populating the graph
 
-    if OPTIONS.owl_import:
-        ont_node = BNode()
-        t(ont_node, RDF.type, OWL.Ontology)
-        t(ont_node, OWL.imports, URIRef("http://www.w3.org/ns/ma-ont"))
+    if profile != "ma-only":
+        graph.bind("id3v2", ID3V2)
 
     t(res, RDF.type, MA.MediaResource)
     t(res, RDF.type, MA.AudioTrack)
@@ -157,7 +135,7 @@ def fill_graph(graph, filename):
     add_metadata("TIT1", "description", False)
 
     add_metadata("TIT2", "title", False)
-    if OPTIONS.extended:
+    if extended:
         make_smart_title(id3, res, t)
         
     add_metadata("TIT3", "title", False)
@@ -165,7 +143,8 @@ def fill_graph(graph, filename):
     # TOLY are provided
 
     add_metadata("TLAN", "hasLanguage", insert_node=True,
-                 val_factory=lang_val_factory, node_factory=lang_node_factory)
+                 val_factory=make_string_literal,
+                 node_factory=lang_node_factory)
 
     contributor_kw = { "exact": False, "insert_node": True,
                        "label_property": FOAF.name }
@@ -202,7 +181,7 @@ def fill_graph(graph, filename):
             rater = BNode()
             t(rating, MA.isProvidedBy, rater)
             t(rater, RDFS.label, make_string_literal(popm.email))
-            if OPTIONS.extended:
+            if extended:
                 t(rater, FOAF.mbox, URIRef("mailto:" + popm.email))
             t(rating, MA.ratingValue, make_decimal_literal(1.0*popm.rating))
         
@@ -226,7 +205,7 @@ def fill_graph(graph, filename):
                 related = URIRef(apic.data)
             else:
                 related = URIRef(res+"#id3-APIC-"+quote(apic.desc))
-            if OPTIONS.profile == "ma-only":
+            if profile == "ma-only":
                 prop = MA.hasRelatedImage
             else:
                 prop = ID3V2["APIC-%s" % apic.type]
@@ -234,21 +213,8 @@ def fill_graph(graph, filename):
             t(res, prop, related)
 
 
-def make_string_literal(txt):
-    return Literal(txt, lang=OPTIONS.language)
-
-def make_decimal_literal(val):
-    return Literal(float(val), datatype=XSD.decimal)
-
 def make_duration_literal(txt):
     return make_decimal_literal(int(txt)/1000.0)
-
-def make_date_literal(txt):
-    txt = str(txt)
-    if len(txt) < 10:
-        raise SkipValue()
-    else:
-        return Literal(txt[:10], datatype=XSD.date)
 
 def make_smart_title(id3, res, t):
     """
@@ -303,54 +269,8 @@ def make_smart_title(id3, res, t):
     lit = make_string_literal("%s%s%s" % (tit1, tit2, tit3))
     t(res, MA["title"], lit)
 
-def lang_val_factory(code):
-    # BCP 47 (used by MAWG) is a superset of iso639-2 (used by ID3),
-    # so keeping the code as-is is acceptable.
-    return make_string_literal(code)
 
-def lang_node_factory(code):
-    # NB: iso639-3 (used by lexvo) is a superset of iso639-2 (used by ID3),
-    # so we can build a lexvo URI by reusin the language tag as is.
-    return URIRef("http://lexvo.org/id/iso639-3/" + code)
-
-
-class SkipValue(Exception):
-    """
-    Use by value factory to indicate that the candidate value is not valid.
-    """
-    pass
-
-def parse_options():
-    op = OptionParser()
-    op.add_option("-H", "--long-help", action="store_true", default=False,
-                  help="display long help")
-    op.add_option("-o", "--owl-import", action="store_true", default=False,
-                  help="include OWL import statement")
-    op.add_option("-p", "--profile", default="default",
-                  choices=["ma-only", "default", "original"])
-    op.add_option("-x", "--extended", action="store_true", default=False)
-    op.add_option("-l", "--language", default=None,
-                  help="language tag for metadata")
-
-    options, args = op.parse_args()
-
-    if options.long_help:
-        op.print_help()
-        print __doc__
-        exit(0)
-
-    return options, args
-
-OPTIONS = None
-
-FOAF = Namespace("http://xmlns.com/foaf/0.1/")
 ID3V2 = Namespace("http://www.id3.org/id3v2.3.0#")
-LEXVO = Namespace("http://lexvo.org/id/iso639-3/")
-MA = Namespace("http://www.w3.org/ns/ma-ont#")
-OWL = Namespace("http://www.w3.org/2002/07/owl#")
-#SKOS = Namespace("http://www.w3.org/2004/02/skos/core#")
-XSD = Namespace("http://www.w3.org/2001/XMLSchema#")
-
 
 if __name__ == "__main__":
-    main()
+    main(fill_graph)
