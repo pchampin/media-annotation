@@ -61,15 +61,15 @@ def main():
     global OPTIONS
     OPTIONS, args = parse_options()
     graph = Graph()
+    graph.bind("", "file://%s/" % pathname2url(abspath(curdir)))
+    graph.bind("foaf", FOAF)
+    graph.bind("id3v2", ID3V2)
+    graph.bind("lexvo", LEXVO)
+    graph.bind("ma", MA)
+    graph.bind("owl", OWL)
+    graph.bind("xsd", XSD)
     for filename in args:
         fill_graph(graph, filename)
-        graph.bind("", "file://%s/" % pathname2url(abspath(curdir)))
-        graph.bind("foaf", FOAF)
-        graph.bind("id3v2", ID3V2)
-        graph.bind("lexvo", LEXVO)
-        graph.bind("ma", MA)
-        graph.bind("owl", OWL)
-        graph.bind("xsd", XSD)
     try:
         print graph.serialize(format="turtle")
     except Exception:
@@ -304,12 +304,13 @@ def make_smart_title(id3, res, t):
     t(res, MA["title"], lit)
 
 def lang_val_factory(code):
-    # FIXME: should convert ISO_639-2 label to BCPl 47
+    # BCP 47 (used by MAWG) is a superset of iso639-2 (used by ID3),
+    # so keeping the code as-is is acceptable.
     return make_string_literal(code)
 
 def lang_node_factory(code):
-    # FIXME: ID3V2 is ISO_639-2, but lexvo uses ISO_639-3 ; they should be
-    # the same in most cases, but maybe not always (or use BCP 47?? as well)
+    # NB: iso639-3 (used by lexvo) is a superset of iso639-2 (used by ID3),
+    # so we can build a lexvo URI by reusin the language tag as is.
     return URIRef("http://lexvo.org/id/iso639-3/" + code)
 
 
