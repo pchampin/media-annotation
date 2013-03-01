@@ -1,0 +1,244 @@
+#!/usr/bin/env python
+# Copyright (c) 2011, Pierre-Antoine Champin <http://champin.net/>, 
+#                     University of Lyon
+# All rights reserved.
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of the University of Lyon nor the names of its
+#       contributors may be used to endorse or promote products derived from
+#       from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS ``AS IS''
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR AND CONTRIBUTORS BE LIABLE FOR
+# ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+#pylint: disable=I0011,C0103,C0111,R0912,R0913,R0915,W0142,W0511,W0603
+
+"""
+I take a list of image files as argument, and outputs the corresponding RDF
+according to the mapping defined by the Ontology for Media Resource [1]_.
+
+I convert EXIF and XMP metadata according to [1]_.
+
+RDF can be generated according to the following *profiles*:
+  * ``default`` will generate ``ma:`` properties for exact matches, and
+    ``exiv2:`` properties with subProperty axioms for related match.
+  * ``ma-only`` will only generate ``ma:`` properties.
+  * ``original`` will always generate ``exiv2:`` properties (even for exact
+    matches) with subProperty axioms to the corresponding ``ma:`` property.
+
+Furthermore, *extended* metadata (i.e. not specified by [1]_) can be generated:
+  * generate a URI for the language (if any)
+  * use foaf:name instead of rdfs:label for instances of ma:Person
+
+[1] http://www.w3.org/TR/mediaont-10/
+"""
+
+from decimal import Decimal, getcontext
+import logging
+from os.path import abspath
+from pyexiv2 import ImageMetadata
+from rdflib import BNode, Literal, Namespace, RDF, RDFS, URIRef
+from rdflib.Node import Node
+from urllib import pathname2url, quote
+from urlparse import urljoin
+
+from ma_common import FOAF, lang_node_factory, MA, main, make_date_literal, \
+    make_decimal_literal, make_string_literal, SkipValue, SKOS, XSD
+
+LOG = logging.getLogger("img2ma")
+logging.basicConfig(loglevel=logging.WARN)
+
+getcontext().prec = 12 # decimal maximum precision
+
+def fill_graph(graph, filename, profile, extended):
+    #pylint: disable=I0011,R0914
+    
+    # useful links:
+    # * http://exiv2.org/tags.html
+    # * http://www.w3.org/TR/mediaont-10/
+
+    try:
+        md = ImageMetadata(filename)
+        md.read()
+    except IOError:
+        # FIXME: should we insert some triples anyway (e.g. RDF.type) ?
+        return
+
+    res = URIRef("file://"+pathname2url(abspath(filename)))
+
+    # first defining some helper functions
+
+    def t(s, p, o):
+        assert isinstance(s, Node), s
+        assert isinstance(p, Node), p
+        assert isinstance(o, Node), o
+        graph.add((s, p, o))
+
+    def add_metadata(
+        key, # the exiv2 tag to use
+        ma_prop, # the name of the ma property to use
+        exact=True, # is the legacy prop an exact match to ma_prop?
+        val_factory=make_string_literal, # to transform legacy val to MA val
+        insert_node=False, # whether an intermediate node must be inserted
+        # the following parameters are only used if extended is True
+        node_factory=None, # function to make the intermediate node
+        label_property=None, # property to label the intermediate node
+    ):
+        """Smart metadata inserter"""
+
+        ma_prop = MA[ma_prop]
+        tag = md.get(key)
+        if tag is not None:
+
+            values = tag.value
+            if not isinstance(values, list):
+                values = [values]
+
+            for val in values:
+
+                if exact and profile == "original" \
+                or not exact and profile != "ma-only":
+                    prop = EXIV2[key]
+                    t(prop, RDFS.subPropertyOf, ma_prop)
+                else:
+                    prop = ma_prop
+
+                try:
+                    obj = val_factory(val)
+                except UnicodeDecodeError:
+                    LOG.warn("Invalid unicode in %s", key)
+                    continue
+                except SkipValue:
+                    continue
+                if insert_node:
+                    if node_factory is None or not extended:
+                        node_factory = lambda _: BNode()
+                    if label_property is None or not extended:
+                        label_property = RDFS.label
+                    else:
+                        t(label_property, RDFS.subPropertyOf, RDFS.label)
+                    subj = node_factory(val)
+                    t(res, prop, subj)
+                    prop2 = label_property
+                else:
+                    subj = res
+                    prop2 = prop
+                t(subj, prop2, obj)
+
+    def make_related_soundfile_uri(val):
+        """I make the URI of the related soundfile, given its local filename."""
+        return URIRef(urljoin(res, val))
+
+
+    # now populating the graph
+
+    if profile != "ma-only":
+        graph.bind("exiv2", EXIV2)
+        graph.bind("skos", SKOS)
+
+    t(res, RDF.type, MA.MediaResource)
+    t(res, RDF.type, MA.Image)
+    
+    add_metadata("Exif.Photo.ImageUniqueID", "identifier")
+
+    add_metadata("Exif.Image.ImageDescription", "title", False)
+
+    add_metadata("Exif.Image.DateTime", "editDate",
+                 val_factory=make_date_literal)
+    add_metadata("Exif.Image.DateTimeOriginal", "creationDate",
+                 val_factory=make_date_literal)
+
+    # adding GPS metadata
+
+    if profile != "original":
+        latref = md.get("Exif.GPSInfo.GPSLatitudeRef")
+        if latref is not None:
+            latref = latref.value
+            latval = md.get("Exif.GPSInfo.GPSLatitude").value
+            latval = latval[0] + latval[1]/60 + latval[2]/3600
+            if latref == 'S':
+                latval = -latval
+            latval = Decimal(latval.numerator) / latval.denominator
+
+        lonref = md.get("Exif.GPSInfo.GPSLongitudeRef")
+        if lonref is not None:
+            lonref = lonref.value
+            lonval = md.get("Exif.GPSInfo.GPSLongitude").value
+            lonval = lonval[0] + lonval[1]/60 + lonval[2]/3600
+            if lonref == 'W':
+                lonval = -lonval
+            lonval = Decimal(lonval.numerator) / lonval.denominator
+    
+        altref = md.get("Exif.GPSInfo.GPSAltitudeRef")
+        if altref is not None:
+            altref = altref.value
+            altval = md.get("Exif.GPSInfo.GPSAltitude").value
+            if altref == 1:
+                altval = -altval
+            altval = Decimal(altval.numerator) / altval.denominator
+    
+        if latref or lonref or (altref is not None):
+            loc = BNode()
+            t(res, MA.location, loc)
+            if latref is not None:
+                t(loc, MA.locationLatitude,
+                  Literal(latval, datatype=XSD.decimal))
+            if lonref is not None:
+                t(loc, MA.locationLongitude,
+                  Literal(lonval, datatype=XSD.decimal))
+            if altref is not None:
+                t(loc, MA.locationAltitude,
+                  Literal(altval, datatype=XSD.decimal))
+    else:
+        for key, ma_prop in {
+                "Exif.GPSInfo.GPSLatitude"     : "locationLatitude",
+                "Exif.GPSInfo.GPSLatitudeRef"  : "locationLatitude",
+                "Exif.GPSInfo.GPSLongitude"    : "locationLongitude",
+                "Exif.GPSInfo.GPSLongitudeRef" : "locationLongitude",
+                "Exif.GPSInfo.GPSAltitude"     : "locationAltitude",
+                "Exif.GPSInfo.GPSAltitudeRef"  : "locationAltitude",
+                }.items():
+            tag = md.get(key)
+            if tag is not None:
+                t(res, EXIV2[key], Literal(tag.raw_value))
+                t(EXIV2[key], SKOS.related, MA[ma_prop])
+
+    # end of GPS data management
+
+    add_metadata("Exif.Photo.UserComment", "description", False)
+
+    add_metadata("Exif.Photo.RelatedSoundFile", "hasRelatedResource", False,
+                 make_related_soundfile_uri)                        
+
+    add_metadata("Exif.Image.Copyright", "copyright")                
+
+    add_metadata("Exif.Image.ImageWidth", "frameWidth", False)                
+    add_metadata("Exif.Image.ImageLength", "frameHeight", False)                
+
+    add_metadata("Exif.Image.Compression", "hasCompression", False,
+                 val_factory=make_compression_uri)                
+
+
+def make_compression_uri(val):
+    """I convert a numeric compression code to a URI"""
+    return EXIV2["Exif.Image.Compression.%s" % val]
+
+
+EXIV2 = Namespace("http://www.exiv2.org/#")
+
+if __name__ == "__main__":
+    main(fill_graph)

@@ -46,6 +46,7 @@ Furthermore, *extended* metadata (i.e. not specified by [1]_) can be generated:
 [1] http://www.w3.org/TR/mediaont-10/
 """
 
+from datetime import datetime
 from os import curdir
 from os.path import abspath
 from optparse import OptionParser
@@ -122,7 +123,7 @@ OPTIONS = None
 
 MA = Namespace("http://www.w3.org/ns/ma-ont#")
 OWL = Namespace("http://www.w3.org/2002/07/owl#")
-#SKOS = Namespace("http://www.w3.org/2004/02/skos/core#")
+SKOS = Namespace("http://www.w3.org/2004/02/skos/core#")
 XSD = Namespace("http://www.w3.org/2001/XMLSchema#")
 FOAF = Namespace("http://xmlns.com/foaf/0.1/")
 LEXVO = Namespace("http://lexvo.org/id/iso639-3/")
@@ -136,8 +137,10 @@ def make_string_literal(txt):
 def make_decimal_literal(val):
     return Literal(float(val), datatype=XSD.decimal)
 
-def make_date_literal(txt):
-    txt = str(txt)
+def make_date_literal(val):
+    if isinstance(val, datetime):
+        return Literal(val)
+    txt = str(val)
     if len(txt) < 10:
         raise SkipValue()
     else:
